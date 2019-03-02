@@ -17,6 +17,7 @@
 package com.android.server.wifi.p2p;
 
 import android.hardware.wifi.supplicant.V1_0.ISupplicantP2pIfaceCallback;
+import vendor.qti.hardware.wifi.supplicant.V2_0.ISupplicantVendorP2PIfaceCallback;
 import android.hardware.wifi.supplicant.V1_0.WpsConfigMethods;
 import android.net.wifi.WpsInfo;
 import android.net.wifi.p2p.WifiP2pConfig;
@@ -24,11 +25,14 @@ import android.net.wifi.p2p.WifiP2pDevice;
 import android.net.wifi.p2p.WifiP2pGroup;
 import android.net.wifi.p2p.WifiP2pProvDiscEvent;
 import android.net.wifi.p2p.WifiP2pWfdInfo;
+import android.net.wifi.p2p.WifiWscVendorInfo;
 import android.net.wifi.p2p.nsd.WifiP2pServiceResponse;
 import android.util.Log;
 
 import com.android.server.wifi.p2p.WifiP2pServiceImpl.P2pStatus;
 import com.android.server.wifi.util.NativeUtil;
+
+import libcore.util.HexEncoding;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -562,3 +566,185 @@ public class SupplicantP2pIfaceCallback extends ISupplicantP2pIfaceCallback.Stub
     }
 }
 
+class SupplicantVendorP2pIfaceCallback extends ISupplicantVendorP2PIfaceCallback.Stub {
+    private static final String TAG = "SupplicantVendorP2pIfaceCallback ";
+    private static final boolean DBG = true;
+
+    private final String mInterface;
+    private final WifiP2pMonitor mMonitor;
+
+    public SupplicantVendorP2pIfaceCallback(String iface, WifiP2pMonitor monitor) {
+        mInterface = iface;
+        mMonitor = monitor;
+    }
+
+
+    protected static void logd(String s) {
+        if (DBG) Log.d(TAG, s);
+    }
+
+    /**
+     * Used to indicate that a P2P device- with WFDR2 has been found.
+     *
+     * @param srcAddress MAC address of the device found. This must either
+     *        be the P2P device address or the P2P interface address.
+     * @param p2pDeviceAddress P2P device address.
+     * @param primaryDeviceType Type of device. Refer to section B.1 of Wifi P2P
+     *        Technical specification v1.2.
+     * @param deviceName Name of the device.
+     * @param configMethods Mask of WPS configuration methods supported by the
+     *        device.
+     * @param deviceCapabilities Refer to section 4.1.4 of Wifi P2P Technical
+     *        specification v1.2.
+     * @param groupCapabilities Refer to section 4.1.4 of Wifi P2P Technical
+     *        specification v1.2.
+     * @param wfdDeviceInfo WFD device info as described in section 5.1.2 of WFD
+     *        technical specification v1.0.0.
+     * @param wfdR2DeviceInfo WFD R2 device info as described in section 5.1.12
+     *        of WFD technical specification v2.0.0
+     */
+    @Override
+    public void onR2DeviceFound(byte[] srcAddress, byte[] p2pDeviceAddress, byte[] primaryDeviceType,
+            String deviceName, short configMethods, byte deviceCapabilities, int groupCapabilities,
+            byte[] wfdDeviceInfo, byte[] wfdR2DeviceInfo) {
+        WifiP2pDevice device = new WifiP2pDevice();
+        device.deviceName = deviceName;
+
+        if (deviceName == null) {
+            Log.e(TAG, "Missing device name.");
+            return;
+        }
+
+        try {
+            device.deviceAddress = NativeUtil.macAddressFromByteArray(p2pDeviceAddress);
+        } catch (Exception e) {
+            Log.e(TAG, "Could not decode device address.", e);
+            return;
+        }
+
+        try {
+            device.primaryDeviceType = new String(HexEncoding.encode(
+                    primaryDeviceType, 0, primaryDeviceType.length));
+        } catch (Exception e) {
+            Log.e(TAG, "Could not encode device primary type.", e);
+            return;
+        }
+
+        device.deviceCapability = deviceCapabilities;
+        device.groupCapability = groupCapabilities;
+        device.wpsConfigMethodsSupported = configMethods;
+        device.status = WifiP2pDevice.AVAILABLE;
+
+        if (wfdDeviceInfo != null && wfdDeviceInfo.length >= 6) {
+            device.wfdInfo = new WifiP2pWfdInfo(
+                    (wfdDeviceInfo[0] << 8) + wfdDeviceInfo[1],
+                    (wfdDeviceInfo[2] << 8) + wfdDeviceInfo[3],
+                    (wfdDeviceInfo[4] << 8) + wfdDeviceInfo[5]);
+        }
+        if (wfdR2DeviceInfo != null && wfdR2DeviceInfo.length >= 2) {
+            device.wfdInfo.setWfdR2Device(
+                    (wfdR2DeviceInfo[0] << 8) + wfdR2DeviceInfo[1]);
+        }
+        logd("R2 Device discovered on " + mInterface + ": " + device + "R2 Info:" + wfdR2DeviceInfo);
+        mMonitor.broadcastP2pDeviceFound(mInterface, device);
+    }
+
+    private int parseAttribute(List <Byte> ip) {
+        return (ip.get(0)<<8|ip.get(1));
+    }
+
+    private int parseInteger(List <Byte> ip) {
+        return (ip.get(0)<<24|ip.get(1)<<16|ip.get(2)<<8|ip.get(3));
+    }
+
+    /**
+     * Used to indicate that a P2P device- with WSC Vendor Extensions has been found.
+     *
+     * @param infoAttributes an array consisting of MAC address
+     *        and  Vendor Extension IE of the device found.
+     *        It could be any protocol. WSC Vendor IE is currently supported
+     * @param type Type of Information Element contained in the array
+     */
+    public void onVendorExtensionFound(ArrayList <Byte> infoAttributes,
+            byte type){
+        logd("Printing received array"+infoAttributes.toString());
+        boolean miceFound = false;
+        if (WifiWscVendorInfo.WSC_VENDOR == type) {
+            WifiWscVendorInfo info = new WifiWscVendorInfo();
+            int length = 0;
+            int attribute = 0;
+            byte [] macByteArray = new byte[6];
+            for (int i = 0; i < 6; i++){
+                macByteArray[i] = infoAttributes.get(i).byteValue();
+            }
+            info.mP2pMacAddress = NativeUtil.macAddressFromByteArray(macByteArray);
+            int pos = 6;//First 6 bytes contain p2p mac address
+            if (infoAttributes.get(pos)==(byte)0x00 &&
+                infoAttributes.get(pos+1)==(byte)0x01 &&
+                infoAttributes.get(pos+2)==(byte)0x37) {
+
+                logd("WSC Vendor extension found");
+                pos+=3;
+
+                // Now Parsing rest of the attributes
+                while (pos < infoAttributes.size()) {
+                    attribute = parseAttribute(infoAttributes.subList(pos,pos+2));
+                    logd("printing parseAttribute return value" + attribute);
+                    pos+=2;
+                    switch (attribute) {
+                        case WifiWscVendorInfo.CAPABILITY_ATTRIBUTE:
+                            pos+=2;
+                            info.setCapability(infoAttributes.get(pos));
+                            pos++;
+                            miceFound = true;
+                            break;
+
+                        case WifiWscVendorInfo.HOSTNAME_ATTRIBUTE:
+                        case WifiWscVendorInfo.BSSID_ATTRIBUTE:
+                            length = parseAttribute(infoAttributes.subList(pos,pos+2));
+                            pos+=2;
+                            byte [] byteArray = new byte[infoAttributes.size()];
+                            for (int i =0 ; i < infoAttributes.size(); i++)
+                                byteArray[i] = infoAttributes.get(i).byteValue();
+
+                            info.setHostName( new String(byteArray,pos,length));
+                            pos+=length;
+                            miceFound = true;
+                            break;
+
+                        case WifiWscVendorInfo.CONNECTION_PREFERENCE_ATTRIBUTE:
+                            info.setConnectionPreference(parseInteger(infoAttributes.subList(pos,pos+4)));
+                            pos+=6;
+                            miceFound = true;
+                            break;
+
+                        case WifiWscVendorInfo.IPADDRESS_ATTRIBUTE:
+                            length = parseAttribute(infoAttributes.subList(pos,pos+2));
+                            pos+=2;
+                            byte [] byteArray1 = new byte[infoAttributes.size()];
+                            for (int i =0 ; i < infoAttributes.size(); i++)
+                                byteArray1[i] = infoAttributes.get(i).byteValue();
+
+                            info.setIpAddress(new  String(byteArray1,pos,length));
+                            pos+=length;
+                            miceFound = true;
+                            break;
+
+                        default:
+                            length = parseAttribute(infoAttributes.subList(pos,pos+2));
+                            pos+=length+2;
+                            break;
+
+                    }
+                }
+            }
+
+            logd("WSC Device discovered Info : " + info);
+            if (miceFound)
+                mMonitor.broadcastWSCVendorIEFound(mInterface,info);
+        }
+        else {
+            logd("Unsupported vendor info");
+        }
+    }
+}

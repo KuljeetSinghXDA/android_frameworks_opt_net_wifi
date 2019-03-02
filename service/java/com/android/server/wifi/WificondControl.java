@@ -79,6 +79,7 @@ public class WificondControl implements IBinder.DeathRecipient {
     private HashMap<String, IPnoScanEvent> mPnoScanEventHandlers = new HashMap<>();
     private HashMap<String, IApInterfaceEventCallback> mApInterfaceListeners = new HashMap<>();
     private WifiNative.WificondDeathEventHandler mDeathEventHandler;
+    private static final int MAX_SSID_LEN = 32;
 
     private class ScanEventHandler extends IScanEvent.Stub {
         private String mIfaceName;
@@ -272,6 +273,38 @@ public class WificondControl implements IBinder.DeathRecipient {
         }
 
         return clientInterface;
+    }
+
+    /**
+     * Unsubscribe scan for specific STA interface configured in wificond.
+     * Additionally, trigger stopPnoScan() before invalidating wificond scanner object.
+     *
+     * @return Returns true on success.
+     */
+    public boolean unsubscribeScan(@NonNull String ifaceName) {
+        if (getClientInterface(ifaceName) == null) {
+            Log.e(TAG, "No valid wificond client interface handler");
+            return false;
+        }
+
+        // stop any active pno scan
+        stopPnoScan(ifaceName);
+
+        try {
+            IWifiScannerImpl scannerImpl = mWificondScanners.get(ifaceName);
+            if (scannerImpl != null) {
+                scannerImpl.unsubscribeScanEvents();
+                scannerImpl.unsubscribePnoScanEvents();
+            }
+        } catch (RemoteException e) {
+            Log.e(TAG, "Failed to unsubscribe wificond scanner due to remote exception");
+            return false;
+        }
+
+        mWificondScanners.remove(ifaceName);
+        mScanEventHandlers.remove(ifaceName);
+        mPnoScanEventHandlers.remove(ifaceName);
+        return true;
     }
 
     /**
@@ -638,9 +671,14 @@ public class WificondControl implements IBinder.DeathRecipient {
             for (String ssid : hiddenNetworkSSIDs) {
                 HiddenNetwork network = new HiddenNetwork();
                 try {
-                    network.ssid = NativeUtil.byteArrayFromArrayList(NativeUtil.decodeSsid(ssid));
+                    network.ssid = WifiGbk.getRandUtfOrGbkBytes(ssid); // wifigbk++
                 } catch (IllegalArgumentException e) {
                     Log.e(TAG, "Illegal argument " + ssid, e);
+                    continue;
+                }
+                if (network.ssid.length > MAX_SSID_LEN) {
+                    Log.e(TAG, "SSID is too long after conversion, skipping this ssid! SSID = " +
+                                network.ssid + " , network.ssid.size = " + network.ssid.length);
                     continue;
                 }
                 settings.hiddenNetworks.add(network);
@@ -684,7 +722,20 @@ public class WificondControl implements IBinder.DeathRecipient {
                     Log.e(TAG, "Illegal argument " + network.ssid, e);
                     continue;
                 }
-                settings.pnoNetworks.add(condNetwork);
+                if (condNetwork.ssid.length <= WifiGbk.MAX_SSID_LENGTH) { //wifigbk++
+                    settings.pnoNetworks.add(condNetwork);
+                }
+                //wifigbk++
+                if (!WifiGbk.isAllAscii(condNetwork.ssid)) {
+                    PnoNetwork condNetwork2 = new PnoNetwork();
+                    condNetwork2.isHidden = condNetwork.isHidden;
+                    condNetwork2.ssid = WifiGbk.toGbk(condNetwork.ssid);
+                    if (condNetwork2.ssid != null) {
+                        settings.pnoNetworks.add(condNetwork2);
+                        Log.i(TAG, "WifiGbk - pnoScan add extra Gbk ssid for " + network.ssid);
+                    }
+                }
+                //wifigbk--
             }
         }
 

@@ -51,7 +51,8 @@ public class WifiConfigurationUtil {
      */
     private static final int ENCLOSING_QUTOES_LEN = 2;
     private static final int SSID_UTF_8_MIN_LEN = 1 + ENCLOSING_QUTOES_LEN;
-    private static final int SSID_UTF_8_MAX_LEN = 32 + ENCLOSING_QUTOES_LEN;
+    private static final int SSID_UTF_8_MAX_LEN = // wifigbk++
+                        WifiGbk.MAX_SSID_UTF_LENGTH + ENCLOSING_QUTOES_LEN;
     private static final int SSID_HEX_MIN_LEN = 2;
     private static final int SSID_HEX_MAX_LEN = 64;
     private static final int PSK_ASCII_MIN_LEN = 8 + ENCLOSING_QUTOES_LEN;
@@ -127,11 +128,40 @@ public class WifiConfigurationUtil {
     }
 
     /**
+     * Helper method to check if the provided |config| corresponds to a SAE network or not.
+     */
+    public static boolean isConfigForSaeNetwork(WifiConfiguration config) {
+        return (config.allowedKeyManagement.get(WifiConfiguration.KeyMgmt.SAE));
+    }
+
+    /**
+     * Helper method to check if the provided |config| corresponds to a OWE network or not.
+     */
+    public static boolean isConfigForOweNetwork(WifiConfiguration config) {
+        return (config.allowedKeyManagement.get(WifiConfiguration.KeyMgmt.OWE));
+    }
+
+    /**
+     * Helper method to check if the provided |config| corresponds to a DPP network or not.
+     */
+    public static boolean isConfigForDppNetwork(WifiConfiguration config) {
+        return (config.allowedKeyManagement.get(WifiConfiguration.KeyMgmt.DPP));
+    }
+
+    /**
      * Helper method to check if the provided |config| corresponds to an open network or not.
      */
     public static boolean isConfigForOpenNetwork(WifiConfiguration config) {
         return !(isConfigForWepNetwork(config) || isConfigForPskNetwork(config)
                 || isConfigForEapNetwork(config));
+    }
+
+    public static boolean isConfigForSha256Network(WifiConfiguration config) {
+        return config.allowedKeyManagement.get(WifiConfiguration.KeyMgmt.FILS_SHA256);
+    }
+
+    public static boolean isConfigForSha384Network(WifiConfiguration config) {
+        return config.allowedKeyManagement.get(WifiConfiguration.KeyMgmt.FILS_SHA384);
     }
 
     /**
@@ -194,6 +224,9 @@ public class WifiConfigurationUtil {
                     != newEnterpriseConfig.getPhase2Method()) {
                 return true;
             }
+            if (getEapSimNum(existingEnterpriseConfig) != getEapSimNum(newEnterpriseConfig)){
+                return true;
+            }
             if (!TextUtils.equals(existingEnterpriseConfig.getIdentity(),
                                   newEnterpriseConfig.getIdentity())
                     || !TextUtils.equals(existingEnterpriseConfig.getAnonymousIdentity(),
@@ -216,6 +249,15 @@ public class WifiConfigurationUtil {
             }
         }
         return false;
+    }
+
+    public static int getEapSimNum(WifiEnterpriseConfig enterpriseConfig){
+        int mSimNum =0;
+        if (enterpriseConfig.getSimNum() != null
+                             && !enterpriseConfig.getSimNum().isEmpty()) {
+            mSimNum = Integer.parseInt(enterpriseConfig.getSimNum());
+        }
+        return mSimNum;
     }
 
     /**
@@ -410,8 +452,8 @@ public class WifiConfigurationUtil {
 
     private static boolean validateKeyMgmt(BitSet keyMgmnt) {
         if (keyMgmnt.cardinality() > 1) {
-            if (keyMgmnt.cardinality() != 2) {
-                Log.e(TAG, "validateKeyMgmt failed: cardinality != 2");
+            if (keyMgmnt.cardinality() > 4) {
+                Log.e(TAG, "validateKeyMgmt failed: cardinality > 4");
                 return false;
             }
             if (!keyMgmnt.get(WifiConfiguration.KeyMgmt.WPA_EAP)) {

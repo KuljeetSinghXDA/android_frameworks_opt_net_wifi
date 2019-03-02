@@ -150,6 +150,7 @@ public class WifiConnectivityManager {
     private final LinkedList<Long> mConnectionAttemptTimeStamps;
 
     private boolean mDbg = false;
+    private boolean DBG = false;
     private boolean mWifiEnabled = false;
     private boolean mWifiConnectivityManagerEnabled = true;
     private boolean mScreenOn = false;
@@ -167,7 +168,7 @@ public class WifiConnectivityManager {
     // Device configs
     private boolean mEnableAutoJoinWhenAssociated;
     private boolean mWaitForFullBandScanResults = false;
-    private boolean mUseSingleRadioChainScanResults = false;
+    private boolean mUseSingleRadioChainScanResults = true;
     private int mFullScanMaxTxRate;
     private int mFullScanMaxRxRate;
 
@@ -202,6 +203,8 @@ public class WifiConnectivityManager {
     // be retrieved in bugreport.
     private void localLog(String log) {
         mLocalLog.log(log);
+        if (DBG)
+            Log.d(TAG, log);
     }
 
     // A periodic/PNO scan will be rescheduled up to MAX_SCAN_RESTART_ALLOWED times
@@ -612,8 +615,8 @@ public class WifiConnectivityManager {
                 R.integer.config_wifi_framework_SECURITY_AWARD);
         mEnableAutoJoinWhenAssociated = context.getResources().getBoolean(
                 R.bool.config_wifi_framework_enable_associated_network_selection);
-        mUseSingleRadioChainScanResults = context.getResources().getBoolean(
-                R.bool.config_wifi_framework_use_single_radio_chain_scan_results_network_selection);
+        //mUseSingleRadioChainScanResults = context.getResources().getBoolean(
+          //      R.bool.config_wifi_framework_use_single_radio_chain_scan_results_network_selection);
         mInitialScoreMax = (Math.max(mScoringParams.getGoodRssi(ScoringParams.BAND2),
                                      mScoringParams.getGoodRssi(ScoringParams.BAND5))
                             + context.getResources().getInteger(
@@ -656,6 +659,17 @@ public class WifiConnectivityManager {
 
         localLog("ConnectivityScanManager initialized and "
                 + (enable ? "enabled" : "disabled"));
+    }
+
+    /**
+     * Enable verbose logging for WifiCountryCode.
+     */
+    public void enableVerboseLogging(int verbose) {
+        if (verbose > 0) {
+            DBG = true;
+        } else {
+            DBG = false;
+        }
     }
 
     /**

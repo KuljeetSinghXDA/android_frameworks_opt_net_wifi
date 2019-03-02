@@ -28,7 +28,7 @@ import android.text.TextUtils;
 import android.util.Log;
 
 import com.android.server.wifi.HalDeviceManager;
-
+import java.util.ArrayList;
 /**
  * Native calls for bring up/shut down of the supplicant daemon and for
  * sending requests to the supplicant daemon
@@ -372,6 +372,27 @@ public class WifiP2pNative {
      */
     public boolean setWfdDeviceInfo(String hex) {
         return mSupplicantP2pIfaceHal.setWfdDeviceInfo(hex);
+    }
+
+     /**
+     * Set Wifi Display device info.
+     *
+     * @param hex WFD device info as described in section 5.1.12 of
+     *        WFD technical specification v2.0.0.
+     * @return true, if operation was successful.
+     */
+    public boolean setWfdR2DeviceInfo(String hex) {
+        return mSupplicantP2pIfaceHal.setWfdR2DeviceInfo(hex);
+    }
+
+    /**
+     * Set WSC Vendor element info.
+     *
+     * @param hex WSC device info as described in a private specification
+     * @return true, if operation was successful.
+     */
+    public boolean setWscVendorIe(ArrayList <Byte>hex) {
+        return mSupplicantP2pIfaceHal.setWscVendorIe(hex);
     }
 
     /**

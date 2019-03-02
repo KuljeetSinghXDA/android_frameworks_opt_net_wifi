@@ -29,6 +29,7 @@ import android.os.Looper;
 import android.os.Message;
 import android.os.SystemClock;
 import android.os.WorkSource;
+import android.os.UserHandle;
 import android.provider.Settings;
 import android.util.Log;
 
@@ -45,6 +46,7 @@ public class WifiController extends StateMachine {
     private static final boolean DBG = false;
     private Context mContext;
     private boolean mFirstUserSignOnSeen = false;
+    private boolean mWifiControllerReady = false;
 
     /**
      * See {@link Settings.Global#WIFI_REENABLE_DELAY_MS}.  This is the default value if a
@@ -64,7 +66,7 @@ public class WifiController extends StateMachine {
     private final Looper mWifiStateMachineLooper;
     private final WifiStateMachinePrime mWifiStateMachinePrime;
     private final WifiSettingsStore mSettingsStore;
-
+    private final WifiApConfigStore mWifiApConfigStore;
     /**
      * Temporary for computing UIDS that are responsible for starting WIFI.
      * Protected by mWifiStateTracker lock.
@@ -97,12 +99,16 @@ public class WifiController extends StateMachine {
     static final int CMD_STA_STOPPED                            = BASE + 20;
     static final int CMD_SCANNING_STOPPED                       = BASE + 21;
 
+    // Vendor specific message. start from Base + 30
+    static final int CMD_DELAY_DISCONNECT                       = BASE + 30;
+
     private DefaultState mDefaultState = new DefaultState();
     private StaEnabledState mStaEnabledState = new StaEnabledState();
     private StaDisabledState mStaDisabledState = new StaDisabledState();
     private StaDisabledWithScanState mStaDisabledWithScanState = new StaDisabledWithScanState();
     private DeviceActiveState mDeviceActiveState = new DeviceActiveState();
     private EcmState mEcmState = new EcmState();
+    private QcStaDisablingState mQcStaDisablingState = new QcStaDisablingState();
 
     private ScanOnlyModeManager.Listener mScanOnlyModeCallback = new ScanOnlyCallback();
     private ClientModeManager.Listener mClientModeCallback = new ClientModeCallback();
@@ -117,14 +123,16 @@ public class WifiController extends StateMachine {
         mWifiStateMachineLooper = wifiStateMachineLooper;
         mWifiStateMachinePrime = wsmp;
         mSettingsStore = wss;
+        mWifiControllerReady = false;
+        mWifiApConfigStore = WifiInjector.getInstance().getWifiApConfigStore();
 
-        // CHECKSTYLE:OFF IndentationCheck
         addState(mDefaultState);
             addState(mStaDisabledState, mDefaultState);
             addState(mStaEnabledState, mDefaultState);
                 addState(mDeviceActiveState, mStaEnabledState);
             addState(mStaDisabledWithScanState, mDefaultState);
             addState(mEcmState, mDefaultState);
+            addState(mQcStaDisablingState, mDefaultState);
         // CHECKSTYLE:ON IndentationCheck
 
         boolean isAirplaneModeOn = mSettingsStore.isAirplaneModeOn();
@@ -175,7 +183,7 @@ public class WifiController extends StateMachine {
                             } else if (state == WifiManager.WIFI_AP_STATE_DISABLED) {
                                 sendMessage(CMD_AP_STOPPED);
                             }
-                        } else if (action.equals(LocationManager.MODE_CHANGED_ACTION)) {
+                        } else if (action.equals(LocationManager.MODE_CHANGED_ACTION) && mWifiControllerReady) {
                             // Location mode has been toggled...  trigger with the scan change
                             // update to make sure we are in the correct mode
                             sendMessage(CMD_SCAN_ALWAYS_MODE_CHANGED);
@@ -249,16 +257,22 @@ public class WifiController extends StateMachine {
     }
 
     class DefaultState extends State {
+
+        @Override
+        public void enter() {
+            mWifiControllerReady = true;
+        }
+
         @Override
         public boolean processMessage(Message msg) {
             switch (msg.what) {
                 case CMD_SCAN_ALWAYS_MODE_CHANGED:
                 case CMD_WIFI_TOGGLED:
-                case CMD_AP_START_FAILURE:
                 case CMD_SCANNING_STOPPED:
                 case CMD_STA_STOPPED:
                 case CMD_STA_START_FAILURE:
                 case CMD_RECOVERY_RESTART_WIFI_CONTINUE:
+                case CMD_DELAY_DISCONNECT:
                     break;
                 case CMD_RECOVERY_DISABLE_WIFI:
                     log("Recovery has been throttled, disable wifi");
@@ -278,6 +292,10 @@ public class WifiController extends StateMachine {
                     break;
                 case CMD_SET_AP:
                     // note: CMD_SET_AP is handled/dropped in ECM mode - will not start here
+
+                    // If request is to start dual sap, turn off sta.
+                    if (msg.arg1 == 1 && mWifiApConfigStore.getDualSapStatus())
+                        transitionTo(mStaDisabledState);
 
                     // first make sure we aren't in airplane mode
                     if (mSettingsStore.isAirplaneModeOn()) {
@@ -312,6 +330,8 @@ public class WifiController extends StateMachine {
                         transitionTo(mEcmState);
                     }
                     break;
+                case CMD_AP_START_FAILURE:
+                    mWifiStateMachinePrime.stopSoftAPMode();
                 case CMD_AP_STOPPED:
                     log("SoftAp mode disabled, determine next state");
                     if (mSettingsStore.isWifiToggleEnabled()) {
@@ -342,6 +362,8 @@ public class WifiController extends StateMachine {
             mDeferredEnableSerialNumber++;
             mHaveDeferredEnable = false;
             mWifiStateMachine.clearANQPCache();
+            mWifiControllerReady = true;
+
         }
         @Override
         public boolean processMessage(Message msg) {
@@ -426,6 +448,35 @@ public class WifiController extends StateMachine {
     }
 
     class StaEnabledState extends State {
+
+        private final BroadcastReceiver br = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                 log("delayed disconnect cancelled. disconnecting...");
+                 if (hasMessages(CMD_DELAY_DISCONNECT)) {
+                     removeMessages(CMD_DELAY_DISCONNECT);
+                     sendMessage(CMD_DELAY_DISCONNECT);
+                 }
+            }
+        };
+
+        private boolean checkAndHandleDelayDisconnectDuration() {
+            int delay = Settings.Secure.getInt(mContext.getContentResolver(),
+                            Settings.Secure.WIFI_DISCONNECT_DELAY_DURATION, 0);
+            if (delay > 0) {
+                log("DISCONNECT_DELAY_DURATION set. Delaying disconnection by: " +delay+ " seconds");
+                Intent intent = new Intent(WifiManager.ACTION_WIFI_DISCONNECT_IN_PROGRESS);
+                intent.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT);
+                mContext.sendOrderedBroadcastAsUser(intent,
+                         UserHandle.ALL, null, br, mWifiStateMachine.getHandler(), 0, null, null);
+
+                sendMessageDelayed(obtainMessage(CMD_DELAY_DISCONNECT), delay * 1000);
+                transitionTo(mQcStaDisablingState);
+            }
+
+            return (delay > 0);
+        }
+
         @Override
         public void enter() {
             log("StaEnabledState.enter()");
@@ -436,7 +487,9 @@ public class WifiController extends StateMachine {
             switch (msg.what) {
                 case CMD_WIFI_TOGGLED:
                     if (! mSettingsStore.isWifiToggleEnabled()) {
-                        if (checkScanOnlyModeAvailable()) {
+                        if (checkAndHandleDelayDisconnectDuration()) {
+                            break;
+                        } else if (checkScanOnlyModeAvailable()) {
                             transitionTo(mStaDisabledWithScanState);
                         } else {
                             transitionTo(mStaDisabledState);
@@ -446,6 +499,12 @@ public class WifiController extends StateMachine {
                 case CMD_AIRPLANE_TOGGLED:
                     // airplane mode toggled on is handled in the default state
                     if (mSettingsStore.isAirplaneModeOn()) {
+                        // delay airplane mode toggle in case of disconnect delay.
+                        if (checkAndHandleDelayDisconnectDuration()) {
+                            deferMessage(msg);
+                            return HANDLED;
+                        }
+
                         return NOT_HANDLED;
                     } else {
                         // when airplane mode is toggled off, but wifi is on, we can keep it on
@@ -466,6 +525,7 @@ public class WifiController extends StateMachine {
                     }
                     return NOT_HANDLED;
                 case CMD_AP_START_FAILURE:
+                    mWifiStateMachinePrime.stopSoftAPMode();
                 case CMD_AP_STOPPED:
                     // already in a wifi mode, no need to check where we should go with softap
                     // stopped
@@ -497,6 +557,7 @@ public class WifiController extends StateMachine {
             mDisabledTimestamp = SystemClock.elapsedRealtime();
             mDeferredEnableSerialNumber++;
             mHaveDeferredEnable = false;
+            mWifiControllerReady = true;
         }
 
         @Override
@@ -536,6 +597,7 @@ public class WifiController extends StateMachine {
                     sendMessage((Message)(msg.obj));
                     break;
                 case CMD_AP_START_FAILURE:
+                    mWifiStateMachinePrime.stopSoftAPMode();
                 case CMD_AP_STOPPED:
                     // already in a wifi mode, no need to check where we should go with softap
                     // stopped
@@ -711,6 +773,41 @@ public class WifiController extends StateMachine {
                 return NOT_HANDLED;
             }
             return NOT_HANDLED;
+        }
+    }
+
+    /**
+     * QcStaDisablingState: This is to handle sta disablment for the cases where
+     *                      delay is expected.
+     */
+    class QcStaDisablingState extends State {
+        @Override
+        public void enter() {
+            log("QcStaDisablingState.enter()");
+        }
+
+        @Override
+        public boolean processMessage(Message msg) {
+            switch (msg.what) {
+                case CMD_WIFI_TOGGLED:
+                case CMD_AIRPLANE_TOGGLED:
+                     log("In QcStaDisablingState, deferMessage");
+                     deferMessage(msg);
+                     break;
+                case CMD_DELAY_DISCONNECT:
+                    if (! mSettingsStore.isWifiToggleEnabled()) {
+                        if (checkScanOnlyModeAvailable()) {
+                            transitionTo(mStaDisabledWithScanState);
+                        } else {
+                            transitionTo(mStaDisabledState);
+                        }
+                    }
+                    break;
+                default:
+                    return NOT_HANDLED;
+
+            }
+            return HANDLED;
         }
     }
 }

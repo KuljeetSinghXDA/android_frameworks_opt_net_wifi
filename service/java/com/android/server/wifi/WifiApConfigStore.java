@@ -27,6 +27,7 @@ import android.content.IntentFilter;
 import android.net.wifi.WifiConfiguration;
 import android.net.wifi.WifiConfiguration.KeyMgmt;
 import android.os.Environment;
+import android.os.SystemProperties;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.TextUtils;
@@ -91,6 +92,11 @@ public class WifiApConfigStore {
     private final FrameworkFacade mFrameworkFacade;
     private boolean mRequiresApBandConversion = false;
 
+    // Dual SAP config
+    private String mBridgeInterfaceName = null;
+    private boolean mDualSapStatus = false;
+
+
     WifiApConfigStore(Context context, Looper looper,
             BackupManagerProxy backupManagerProxy, FrameworkFacade frameworkFacade) {
         this(context, looper, backupManagerProxy, frameworkFacade, DEFAULT_AP_CONFIG_FILE);
@@ -133,6 +139,9 @@ public class WifiApConfigStore {
             writeApConfiguration(mApConfigFile, mWifiApConfig);
         }
 
+        mBridgeInterfaceName = SystemProperties
+                .get("persist.vendor.wifi.softap.bridge.interface", "wifi_br0");
+
         IntentFilter filter = new IntentFilter();
         filter.addAction(ACTION_HOTSPOT_CONFIG_USER_TAPPED_CONTENT);
         mContext.registerReceiver(
@@ -155,6 +164,20 @@ public class WifiApConfigStore {
                     }
                 }
             };
+
+   /* Additional APIs(get/set) to support SAP + SAP Feature */
+
+    public synchronized String getBridgeInterface() {
+        return mBridgeInterfaceName;
+    }
+
+    public synchronized boolean getDualSapStatus() {
+        return mDualSapStatus;
+    }
+
+    public synchronized void setDualSapStatus(boolean enable) {
+        mDualSapStatus = enable;
+    }
 
     /**
      * Return the current soft access point configuration.

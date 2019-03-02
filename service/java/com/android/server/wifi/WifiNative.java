@@ -31,7 +31,9 @@ import android.net.wifi.WifiScanner;
 import android.net.wifi.WifiWakeReasonAndCounts;
 import android.os.INetworkManagementService;
 import android.os.RemoteException;
+import android.net.wifi.WifiDppConfig;
 import android.os.SystemClock;
+import android.os.SystemProperties;
 import android.text.TextUtils;
 import android.util.Log;
 import android.util.SparseArray;
@@ -115,8 +117,9 @@ public class WifiNative {
         /** Type of ifaces possible */
         public static final int IFACE_TYPE_AP = 0;
         public static final int IFACE_TYPE_STA = 1;
+        public static final int IFACE_TYPE_FST = 2;
 
-        @IntDef({IFACE_TYPE_AP, IFACE_TYPE_STA})
+        @IntDef({IFACE_TYPE_AP, IFACE_TYPE_STA, IFACE_TYPE_FST})
         @Retention(RetentionPolicy.SOURCE)
         public @interface IfaceType{}
 
@@ -147,7 +150,8 @@ public class WifiNative {
                 .append(",")
                 .append("Id=").append(id)
                 .append(",")
-                .append("Type=").append(type == IFACE_TYPE_STA ? "STA" : "AP")
+                .append("Type=").append(type == IFACE_TYPE_STA ? "STA" :
+                                        type == IFACE_TYPE_AP ? "AP" : "FST")
                 .append("}");
             return sb.toString();
         }
@@ -404,6 +408,7 @@ public class WifiNative {
             }
             stopSupplicantIfNecessary();
             stopHalAndWificondIfNecessary();
+            removeFstInterface();
         }
     }
 
@@ -413,7 +418,11 @@ public class WifiNative {
             if (!unregisterNetworkObserver(iface.networkObserver)) {
                 Log.e(TAG, "Failed to unregister network observer on " + iface);
             }
-            if (!mHostapdHal.removeAccessPoint(iface.name)) {
+            if (mHostapdHal.isVendorHostapdHal()) {
+                if (!mHostapdHal.removeVendorAccessPoint(iface.name)) {
+                    Log.e(TAG, "Failed to remove vendor access point on " + iface);
+                }
+            } else if (!mHostapdHal.removeAccessPoint(iface.name)) {
                 Log.e(TAG, "Failed to remove access point on " + iface);
             }
             if (!mHostapdHal.deregisterDeathHandler()) {
@@ -427,6 +436,7 @@ public class WifiNative {
                 Log.e(TAG, "Failed to teardown iface in wificond on " + iface);
             }
             stopHalAndWificondIfNecessary();
+            removeFstInterface();
         }
     }
 
@@ -477,14 +487,12 @@ public class WifiNative {
      * daemon's death.
      */
     private void onNativeDaemonDeath() {
-        synchronized (mLock) {
             for (StatusListener listener : mStatusListeners) {
                 listener.onStatusChanged(false);
             }
             for (StatusListener listener : mStatusListeners) {
                 listener.onStatusChanged(true);
             }
-        }
     }
 
     /**
@@ -493,11 +501,9 @@ public class WifiNative {
     private class VendorHalDeathHandlerInternal implements VendorHalDeathEventHandler {
         @Override
         public void onDeath() {
-            synchronized (mLock) {
                 Log.i(TAG, "Vendor HAL died. Cleaning up internal state.");
                 onNativeDaemonDeath();
                 mWifiMetrics.incrementNumHalCrashes();
-            }
         }
     }
 
@@ -507,11 +513,9 @@ public class WifiNative {
     private class WificondDeathHandlerInternal implements WificondDeathEventHandler {
         @Override
         public void onDeath() {
-            synchronized (mLock) {
                 Log.i(TAG, "wificond died. Cleaning up internal state.");
                 onNativeDaemonDeath();
                 mWifiMetrics.incrementNumWificondCrashes();
-            }
         }
     }
 
@@ -521,11 +525,9 @@ public class WifiNative {
     private class SupplicantDeathHandlerInternal implements SupplicantDeathEventHandler {
         @Override
         public void onDeath() {
-            synchronized (mLock) {
                 Log.i(TAG, "wpa_supplicant died. Cleaning up internal state.");
                 onNativeDaemonDeath();
                 mWifiMetrics.incrementNumSupplicantCrashes();
-            }
         }
     }
 
@@ -535,11 +537,9 @@ public class WifiNative {
     private class HostapdDeathHandlerInternal implements HostapdDeathEventHandler {
         @Override
         public void onDeath() {
-            synchronized (mLock) {
                 Log.i(TAG, "hostapd died. Cleaning up internal state.");
                 onNativeDaemonDeath();
                 mWifiMetrics.incrementNumHostapdCrashes();
-            }
         }
     }
 
@@ -717,6 +717,12 @@ public class WifiNative {
      */
     private boolean removeStaIface(@NonNull Iface iface) {
         synchronized (mLock) {
+            // For dynamically added interface(s), stop processing scan queries/commands
+            // before deleting interface. This internally triggers stopPnoScan() which
+            // otherwise won't be served on deleted interface.
+            if (!mWificondControl.unsubscribeScan(iface.name))
+                Log.i(TAG, "Unsubscribe scan failed.");
+
             if (mWifiVendorHal.isVendorHalSupported()) {
                 return mWifiVendorHal.removeStaIface(iface.name);
             } else {
@@ -833,6 +839,85 @@ public class WifiNative {
         }
     }
 
+    private boolean setupFstInterface(@NonNull Iface iface)
+    {
+        int fstEnabled = SystemProperties.getInt("persist.vendor.fst.rate.upgrade.en", 0);
+        Log.d(TAG, "fst " + ((fstEnabled == 1) ? "enabled" : "disabled"));
+        if (fstEnabled != 1) {
+            Log.d(TAG, "FST disabled, not creating FST interface");
+            return true;
+        }
+        boolean hasOther = mIfaceMgr.hasAnyIfaceOfType(iface.type == Iface.IFACE_TYPE_STA ?
+                                                       Iface.IFACE_TYPE_AP : Iface.IFACE_TYPE_STA);
+        if (hasOther) {
+            Log.e(TAG, "FST not supported in STA/SAP concurrency");
+            return false;
+        }
+        Iface fstIface = mIfaceMgr.findAnyIfaceOfType(iface.IFACE_TYPE_FST);
+        if (fstIface != null) {
+            Log.e(TAG, "FST interface already added");
+            return false;
+        }
+        String defaultFstInterfaceName = "bond0"; // interface used for fst
+        String fstInterfaceName = SystemProperties.get("persist.vendor.fst.data.interface",
+                defaultFstInterfaceName);
+
+        fstIface = mIfaceMgr.allocateIface(Iface.IFACE_TYPE_FST);
+        if (fstIface == null) {
+            Log.e(TAG, "Failed to allocate FST interface");
+            return false;
+        }
+        fstIface.name = fstInterfaceName;
+        fstIface.externalListener = iface.externalListener;
+        iface.externalListener = new InterfaceCallback() {
+            public void onDestroyed(String ifaceName) {
+                /* nothing */
+            }
+            public void onDown(String ifaceName) {
+                /* nothing */
+            }
+            public void onUp(String ifaceName) {
+                /* nothing */
+            }
+        };
+        iface.networkObserver = new NetworkObserverInternal(iface.id);
+        if (!registerNetworkObserver(iface.networkObserver)) {
+            Log.e(TAG, "Failed to register network observer on " + fstIface);
+            iface.externalListener = fstIface.externalListener;
+            teardownInterface(fstIface.name);
+            return false;
+        }
+        return true;
+    }
+
+    private void removeFstInterface() {
+        Iface iface = mIfaceMgr.findAnyIfaceOfType(Iface.IFACE_TYPE_FST);
+        if (iface == null) {
+            return;
+        }
+        mIfaceMgr.removeIface(iface.id);
+        // the FST bonding interface is never destroyed
+        // make sure it is just brought down
+        try {
+            mNwManagementService.setInterfaceDown(iface.name);
+            mNwManagementService.clearInterfaceAddresses(iface.name);
+        } catch (RemoteException re) {
+            Log.e(TAG, "Unable to change interface settings: " + re);
+        } catch (IllegalStateException ie) {
+            Log.e(TAG, "Unable to change interface settings: " + ie);
+        }
+    }
+
+    public String getFstDataInterfaceName() {
+        synchronized(mLock) {
+            Iface iface = mIfaceMgr.findAnyIfaceOfType(Iface.IFACE_TYPE_FST);
+            if (iface != null) {
+                return iface.name;
+            }
+            return null;
+        }
+    }
+
     /**
      * Setup an interface for Client mode operations.
      *
@@ -868,6 +953,12 @@ public class WifiNative {
                 Log.e(TAG, "Failed to create STA iface in vendor HAL");
                 mIfaceMgr.removeIface(iface.id);
                 mWifiMetrics.incrementNumSetupClientInterfaceFailureDueToHal();
+                return null;
+            }
+            if (!setupFstInterface(iface)) {
+                Log.e(TAG, "Failed to setup fst interface from: " + iface);
+                teardownInterface(iface.name);
+                mWifiMetrics.incrementNumSetupClientInterfaceFailureDueToWificond();
                 return null;
             }
             if (mWificondControl.setupInterfaceForClientMode(iface.name) == null) {
@@ -927,6 +1018,12 @@ public class WifiNative {
                 mWifiMetrics.incrementNumSetupSoftApInterfaceFailureDueToHal();
                 return null;
             }
+            if (!setupFstInterface(iface)) {
+                Log.e(TAG, "Failed to setup fst interface from: " + iface);
+                teardownInterface(iface.name);
+                mWifiMetrics.incrementNumSetupSoftApInterfaceFailureDueToWificond();
+                return null;
+            }
             if (mWificondControl.setupInterfaceForSoftApMode(iface.name) == null) {
                 Log.e(TAG, "Failed to setup iface in wificond on " + iface);
                 teardownInterface(iface.name);
@@ -943,6 +1040,49 @@ public class WifiNative {
             // update the interface state before we exit.
             onInterfaceStateChanged(iface, isInterfaceUp(iface.name));
             Log.i(TAG, "Successfully setup " + iface);
+            return iface.name;
+        }
+    }
+
+    /**
+     * Setup an interface for Bridge mode operations.
+     *
+     * This method configures an interface in Bridge mode. This is used only to register
+     * for interface callbacks (up/down/enable/disabled)
+     *
+     * @param interfaceCallback Associated callback for notifying status changes for the iface.
+     * @return Returns the name of the allocated interface, will be null on failure.
+     */
+    public String setupInterfaceForBridgeMode(@NonNull InterfaceCallback interfaceCallback) {
+        synchronized (mLock) {
+            if (!startHal()) {
+                Log.e(TAG, "Failed to start Hal");
+                mWifiMetrics.incrementNumSetupSoftApInterfaceFailureDueToHal();
+                return null;
+            }
+            Iface iface = mIfaceMgr.allocateIface(Iface.IFACE_TYPE_AP);
+            if (iface == null) {
+                Log.e(TAG, "Failed to allocate new bridge iface");
+                return null;
+            }
+            iface.externalListener = interfaceCallback;
+            iface.name = WifiInjector.getInstance().getWifiApConfigStore().getBridgeInterface();
+            if (TextUtils.isEmpty(iface.name)) {
+                Log.e(TAG, "Failed to create Bridge iface in wifinative");
+                mIfaceMgr.removeIface(iface.id);
+                mWifiMetrics.incrementNumSetupSoftApInterfaceFailureDueToHal();
+                return null;
+            }
+            iface.networkObserver = new NetworkObserverInternal(iface.id);
+            if (!registerNetworkObserver(iface.networkObserver)) {
+                Log.e(TAG, "Failed to register network observer on " + iface);
+                teardownInterface(iface.name);
+                return null;
+            }
+            // Just to avoid any race conditions with interface state change callbacks,
+            // update the interface state before we exit.
+            onInterfaceStateChanged(iface, isInterfaceUp(iface.name));
+            Log.i(TAG, "Successfully setup bridge " + iface);
             return iface.name;
         }
     }
@@ -1208,6 +1348,16 @@ public class WifiNative {
          * Invoked when the channel switch event happens.
          */
         void onSoftApChannelSwitched(int frequency, int bandwidth);
+
+        /**
+         * Invoked when the station connected to Any AP.
+         */
+        void onStaConnected(String bssidStr);
+
+        /**
+         * Invoked when the station disconnected to Any AP.
+         */
+        void onStaDisconnected(String bssidStr);
     }
 
     private static final int CONNECT_TO_HOSTAPD_RETRY_INTERVAL_MS = 100;
@@ -1264,7 +1414,14 @@ public class WifiNative {
             mWifiMetrics.incrementNumSetupSoftApInterfaceFailureDueToHostapd();
             return false;
         }
-        if (!mHostapdHal.addAccessPoint(ifaceName, config)) {
+
+        if (mHostapdHal.isVendorHostapdHal()) {
+            if (!mHostapdHal.addVendorAccessPoint(ifaceName, config, listener)) {
+                Log.e(TAG, "Failed to add Vendor acccess point");
+                mWifiMetrics.incrementNumSetupSoftApInterfaceFailureDueToHostapd();
+                return false;
+            }
+        } else if (!mHostapdHal.addAccessPoint(ifaceName, config)) {
             Log.e(TAG, "Failed to add acccess point");
             mWifiMetrics.incrementNumSetupSoftApInterfaceFailureDueToHostapd();
             return false;
@@ -1279,8 +1436,12 @@ public class WifiNative {
      * @return true on success, false otherwise.
      */
     public boolean stopSoftAp(@NonNull String ifaceName) {
-        if (!mHostapdHal.removeAccessPoint(ifaceName)) {
-            Log.e(TAG, "Failed to remove access point");
+        if (mHostapdHal.isVendorHostapdHal()) {
+            if (!mHostapdHal.removeVendorAccessPoint(ifaceName)) {
+                Log.e(TAG, "Failed to remove vendor access point on " + ifaceName);
+            }
+        } else if (!mHostapdHal.removeAccessPoint(ifaceName)) {
+            Log.e(TAG, "Failed to remove access point on " + ifaceName);
         }
         return mWificondControl.stopHostapd(ifaceName);
     }
@@ -1486,6 +1647,17 @@ public class WifiNative {
     }
 
     /**
+     * Get capabilities from driver
+     *
+     * @param ifaceName Name of the interface.
+     * @param capaType which driver capability to get, ex. key_mgmt
+     * @return String of capabilities fetched from driver.
+     */
+     public String getCapabilities(@NonNull String ifaceName, String capaType) {
+         return mSupplicantStaIfaceHal.getCapabilities(ifaceName, capaType);
+    }
+
+    /**
      * Set country code.
      *
      * @param ifaceName Name of the interface.
@@ -1494,6 +1666,26 @@ public class WifiNative {
      */
     public boolean setCountryCode(@NonNull String ifaceName, String countryCode) {
         return mSupplicantStaIfaceHal.setCountryCode(ifaceName, countryCode);
+    }
+
+    /**
+     * Flush all previously configured HLPs.
+     *
+     * @return true if request is sent successfully, false otherwise.
+     */
+    public boolean flushAllHlp(@NonNull String ifaceName) {
+        return mSupplicantStaIfaceHal.flushAllHlp(ifaceName);
+    }
+
+    /**
+     * Set FILS HLP packet.
+     *
+     * @param dst Destination MAC address.
+     * @param hlpPacket Hlp Packet data in hex.
+     * @return true if request is sent successfully, false otherwise.
+     */
+    public boolean addHlpReq(@NonNull String ifaceName, String dst, String hlpPacket) {
+        return mSupplicantStaIfaceHal.addHlpReq(ifaceName, dst, hlpPacket);
     }
 
     /**
@@ -2296,7 +2488,20 @@ public class WifiNative {
      * @return true for success
      */
     public boolean setCountryCodeHal(@NonNull String ifaceName, String countryCode) {
+        mHostapdHal.setCountryCode(countryCode);
         return mWifiVendorHal.setCountryCodeHal(ifaceName, countryCode);
+    }
+
+    /**
+     * Set hostapd parameters via QSAP command.
+     *
+     * This would call QSAP library APIs via hostapd hidl.
+     *
+     * @param cmd QSAP command.
+     * @return true on success, false otherwise.
+     */
+    public boolean setHostapdParams(@NonNull String cmd) {
+        return mHostapdHal.setHostapdParams(cmd);
     }
 
     //---------------------------------------------------------------------------------
@@ -2860,5 +3065,131 @@ public class WifiNative {
         } else {
             return "*** failed to read kernel log ***";
         }
+    }
+
+    /**
+     * Add the DPP bootstrap info obtained from QR code.
+     *
+     * @param ifaceName Name of the interface.
+     * @param channel Channel for communicating with the state machine
+     * @param uri:The URI obtained from the QR code.
+     *
+     * @return: Handle to strored info else -1 on failure
+     */
+    public int dppAddBootstrapQrCode(@NonNull String ifaceName, String uri) {
+        return mSupplicantStaIfaceHal.dppAddBootstrapQrCode(ifaceName, uri);
+    }
+
+    /**
+     * Generate bootstrap URI based on the passed arguments
+     *
+     * @param ifaceName Name of the interface.
+     * @param config – bootstrap generate config
+     *
+     * @return: Handle to strored URI info else -1 on failure
+     */
+    public int dppBootstrapGenerate(@NonNull String ifaceName, WifiDppConfig config) {
+        return mSupplicantStaIfaceHal.dppBootstrapGenerate(ifaceName, config);
+    }
+
+    /**
+     * Get bootstrap URI based on bootstrap ID
+     *
+     * @param ifaceName Name of the interface.
+     * @param bootstrap_id: Stored bootstrap ID
+     *
+     * @return: URI string else -1 on failure
+     */
+    public String dppGetUri(@NonNull String ifaceName, int bootstrap_id) {
+        return mSupplicantStaIfaceHal.dppGetUri(ifaceName, bootstrap_id);
+    }
+
+    /**
+     * Remove bootstrap URI based on bootstrap ID.
+     *
+     * @param ifaceName Name of the interface.
+     * @param bootstrap_id: Stored bootstrap ID
+     *
+     * @return: 0 – Success or -1 on failure
+     */
+    public int dppBootstrapRemove(@NonNull String ifaceName, int bootstrap_id) {
+        return mSupplicantStaIfaceHal.dppBootstrapRemove(ifaceName, bootstrap_id);
+    }
+
+    /**
+     * start listen on the channel specified waiting to receive
+     * the DPP Authentication request.
+     *
+     * @param ifaceName Name of the interface.
+     * @param frequency: DPP listen frequency
+     * @param dpp_role: Configurator/Enrollee role
+     * @param qr_mutual: Mutual authentication required
+     * @param netrole_ap: network role
+     *
+     * @return: Returns 0 if a DPP-listen work is successfully
+     *  queued and -1 on failure.
+     */
+    public int dppListen(@NonNull String ifaceName, String frequency, int dpp_role,
+                         boolean qr_mutual, boolean netrole_ap) {
+        return mSupplicantStaIfaceHal.dppListen(ifaceName, frequency, dpp_role, qr_mutual, netrole_ap);
+    }
+
+    /**
+     * stop ongoing dpp listen.
+     *
+     * @param ifaceName Name of the interface.
+     */
+    public boolean dppStopListen(@NonNull String ifaceName) {
+        return mSupplicantStaIfaceHal.dppStopListen(ifaceName);
+    }
+
+    /**
+     * Adds the DPP configurator
+     *
+     * @param ifaceName Name of the interface.
+     * @param curve curve used for dpp encryption
+     * @param key private key
+     * @param expiry timeout in seconds
+     *
+     * @return: Identifier of the added configurator or -1 on failure
+     */
+    public int dppConfiguratorAdd(@NonNull String ifaceName, String curve, String key, int expiry) {
+        return mSupplicantStaIfaceHal.dppConfiguratorAdd(ifaceName, curve, key, expiry);
+    }
+
+    /**
+     * Remove the added configurator through dppConfiguratorAdd.
+     *
+     * @param ifaceName Name of the interface.
+     * @param config_id: DPP Configurator ID
+     *
+     * @return: Handle to strored info else -1 on failure
+     */
+    public int dppConfiguratorRemove(@NonNull String ifaceName, int config_id) {
+        return mSupplicantStaIfaceHal.dppConfiguratorRemove(ifaceName, config_id);
+    }
+
+    /**
+     * Start DPP authentication and provisioning with the specified peer
+     *
+     * @param ifaceName Name of the interface.
+     * @param config – dpp auth init config
+     *
+     * @return: 0 if DPP Authentication request was transmitted and -1 on failure
+     */
+    public int  dppStartAuth(@NonNull String ifaceName, WifiDppConfig config) {
+        return mSupplicantStaIfaceHal.dppStartAuth(ifaceName, config);
+    }
+
+    /**
+     * Retrieve Private key to be used for configurator
+     *
+     * @param ifaceName Name of the interface.
+     * @param id: id of configurator object
+     *
+     * @return: Key string else -1 on failure
+     */
+    public String dppConfiguratorGetKey(@NonNull String ifaceName, int id) {
+        return mSupplicantStaIfaceHal.dppConfiguratorGetKey(ifaceName, id);
     }
 }

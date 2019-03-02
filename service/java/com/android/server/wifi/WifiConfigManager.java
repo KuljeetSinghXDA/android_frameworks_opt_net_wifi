@@ -54,6 +54,7 @@ import com.android.server.wifi.hotspot2.PasspointManager;
 import com.android.server.wifi.util.TelephonyUtil;
 import com.android.server.wifi.util.WifiPermissionsUtil;
 import com.android.server.wifi.util.WifiPermissionsWrapper;
+import com.android.server.wifi.util.ScanResultUtil;
 
 import org.xmlpull.v1.XmlPullParserException;
 
@@ -837,6 +838,16 @@ public class WifiConfigManager {
             internalConfig.allowedGroupCiphers =
                     (BitSet) externalConfig.allowedGroupCiphers.clone();
         }
+        if (externalConfig.allowedGroupMgmtCiphers != null
+                && !externalConfig.allowedGroupMgmtCiphers.isEmpty()) {
+            internalConfig.allowedGroupMgmtCiphers =
+                    (BitSet) externalConfig.allowedGroupMgmtCiphers.clone();
+        }
+        if (externalConfig.allowedSuiteBCiphers != null
+                && !externalConfig.allowedSuiteBCiphers.isEmpty()) {
+            internalConfig.allowedSuiteBCiphers =
+                    (BitSet) externalConfig.allowedSuiteBCiphers.clone();
+        }
 
         // Copy over the |IpConfiguration| parameters if set.
         if (externalConfig.getIpConfiguration() != null) {
@@ -858,6 +869,8 @@ public class WifiConfigManager {
             }
         }
 
+        internalConfig.shareThisAp = externalConfig.shareThisAp;
+
         // Copy over the |WifiEnterpriseConfig| parameters if set.
         if (externalConfig.enterpriseConfig != null) {
             internalConfig.enterpriseConfig.copyFromExternal(
@@ -867,6 +880,19 @@ public class WifiConfigManager {
         // Copy over any metered information.
         internalConfig.meteredHint = externalConfig.meteredHint;
         internalConfig.meteredOverride = externalConfig.meteredOverride;
+        // Copy over the DPP configuration parameters if set.
+        if (externalConfig.dppConnector != null) {
+            internalConfig.dppConnector = externalConfig.dppConnector;
+        }
+        if (externalConfig.dppNetAccessKey != null) {
+            internalConfig.dppNetAccessKey = externalConfig.dppNetAccessKey;
+        }
+        if (externalConfig.dppNetAccessKeyExpiry >= 0) {
+            internalConfig.dppNetAccessKeyExpiry = externalConfig.dppNetAccessKeyExpiry;
+        }
+        if (externalConfig.dppCsign != null) {
+            internalConfig.dppCsign = externalConfig.dppCsign;
+        }
     }
 
     /**
@@ -887,12 +913,18 @@ public class WifiConfigManager {
         configuration.allowedKeyManagement.set(WifiConfiguration.KeyMgmt.WPA_EAP);
 
         configuration.allowedPairwiseCiphers.set(WifiConfiguration.PairwiseCipher.CCMP);
+        configuration.allowedPairwiseCiphers.set(WifiConfiguration.PairwiseCipher.GCMP);
         configuration.allowedPairwiseCiphers.set(WifiConfiguration.PairwiseCipher.TKIP);
 
         configuration.allowedGroupCiphers.set(WifiConfiguration.GroupCipher.CCMP);
+        configuration.allowedGroupCiphers.set(WifiConfiguration.GroupCipher.GCMP);
         configuration.allowedGroupCiphers.set(WifiConfiguration.GroupCipher.TKIP);
         configuration.allowedGroupCiphers.set(WifiConfiguration.GroupCipher.WEP40);
         configuration.allowedGroupCiphers.set(WifiConfiguration.GroupCipher.WEP104);
+
+        configuration.allowedGroupMgmtCiphers.set(WifiConfiguration.GroupMgmtCipher.CMAC);
+
+        configuration.allowedSuiteBCiphers.set(WifiConfiguration.SuiteBCipher.ECDHE_ECDSA);
 
         configuration.setIpAssignment(IpConfiguration.IpAssignment.DHCP);
         configuration.setProxySettings(IpConfiguration.ProxySettings.NONE);
@@ -1992,6 +2024,13 @@ public class WifiConfigManager {
         WifiConfiguration config = null;
         try {
             config = mConfiguredNetworks.getByScanResultForCurrentUser(scanResult);
+            if (config == null && ScanResultUtil.isScanResultForSaeNetwork(scanResult)
+                && ScanResultUtil.isScanResultForPskNetwork(scanResult)) {
+                ScanResultMatchInfo matchInfo = new ScanResultMatchInfo();
+                matchInfo.networkSsid = ScanResultUtil.createQuotedSSID(scanResult.SSID);
+                matchInfo.networkType = ScanResultMatchInfo.NETWORK_TYPE_PSK;
+                config = mConfiguredNetworks.getByScanResultForCurrentUser(matchInfo);
+            }
         } catch (IllegalArgumentException e) {
             Log.e(TAG, "Failed to lookup network from config map", e);
         }

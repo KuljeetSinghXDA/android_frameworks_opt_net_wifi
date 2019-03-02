@@ -78,6 +78,7 @@ public class SoftApManager implements ActiveModeManager {
     private final WifiManager.SoftApCallback mCallback;
 
     private String mApInterfaceName;
+    private String mDataInterfaceName;
     private boolean mIfaceIsUp;
 
     private final WifiApConfigStore mWifiApConfigStore;
@@ -91,7 +92,10 @@ public class SoftApManager implements ActiveModeManager {
     private int mReportedBandwidth = -1;
 
     private int mNumAssociatedStations = 0;
+    private int mQCNumAssociatedStations = 0;
     private boolean mTimeoutEnabled = false;
+    private String[] mdualApInterfaces;
+    private boolean expectedStop = false;
 
     private final SarManager mSarManager;
 
@@ -109,6 +113,18 @@ public class SoftApManager implements ActiveModeManager {
         public void onSoftApChannelSwitched(int frequency, int bandwidth) {
             mStateMachine.sendMessage(
                     SoftApStateMachine.CMD_SOFT_AP_CHANNEL_SWITCHED, frequency, bandwidth);
+        }
+
+        @Override
+        public void onStaConnected(String Macaddr) {
+            mStateMachine.sendMessage(
+                    SoftApStateMachine.CMD_CONNECTED_STATIONS, Macaddr);
+        }
+
+        @Override
+        public void onStaDisconnected(String Macaddr) {
+            mStateMachine.sendMessage(
+                    SoftApStateMachine.CMD_DISCONNECTED_STATIONS, Macaddr);
         }
     };
 
@@ -136,6 +152,7 @@ public class SoftApManager implements ActiveModeManager {
             mApConfig = config;
         }
         mWifiMetrics = wifiMetrics;
+        mdualApInterfaces = new String[2];
         mSarManager = sarManager;
         mStateMachine = new SoftApStateMachine(looper);
     }
@@ -152,6 +169,7 @@ public class SoftApManager implements ActiveModeManager {
      */
     public void stop() {
         Log.d(TAG, " currentstate: " + getCurrentStateName());
+        expectedStop = true;
         if (mApInterfaceName != null) {
             if (mIfaceIsUp) {
                 updateApState(WifiManager.WIFI_AP_STATE_DISABLING,
@@ -217,7 +235,7 @@ public class SoftApManager implements ActiveModeManager {
             intent.putExtra(WifiManager.EXTRA_WIFI_AP_FAILURE_REASON, reason);
         }
 
-        intent.putExtra(WifiManager.EXTRA_WIFI_AP_INTERFACE_NAME, mApInterfaceName);
+        intent.putExtra(WifiManager.EXTRA_WIFI_AP_INTERFACE_NAME, mDataInterfaceName);
         intent.putExtra(WifiManager.EXTRA_WIFI_AP_MODE, mMode);
         mContext.sendStickyBroadcastAsUser(intent, UserHandle.ALL);
     }
@@ -281,6 +299,10 @@ public class SoftApManager implements ActiveModeManager {
      * Teardown soft AP and teardown the interface.
      */
     private void stopSoftAp() {
+        if (mWifiApConfigStore.getDualSapStatus()) {
+            mWifiNative.teardownInterface(mdualApInterfaces[0]);
+            mWifiNative.teardownInterface(mdualApInterfaces[1]);
+        }
         mWifiNative.teardownInterface(mApInterfaceName);
         Log.d(TAG, "Soft AP is stopped");
     }
@@ -295,6 +317,8 @@ public class SoftApManager implements ActiveModeManager {
         public static final int CMD_INTERFACE_DESTROYED = 7;
         public static final int CMD_INTERFACE_DOWN = 8;
         public static final int CMD_SOFT_AP_CHANNEL_SWITCHED = 9;
+        public static final int CMD_CONNECTED_STATIONS = 10;
+        public static final int CMD_DISCONNECTED_STATIONS = 11;
 
         private final State mIdleState = new IdleState();
         private final State mStartedState = new StartedState();
@@ -302,25 +326,111 @@ public class SoftApManager implements ActiveModeManager {
         private final InterfaceCallback mWifiNativeInterfaceCallback = new InterfaceCallback() {
             @Override
             public void onDestroyed(String ifaceName) {
-                if (mApInterfaceName != null && mApInterfaceName.equals(ifaceName)) {
+                if (mDataInterfaceName != null && mDataInterfaceName.equals(ifaceName)) {
                     sendMessage(CMD_INTERFACE_DESTROYED);
                 }
             }
 
             @Override
             public void onUp(String ifaceName) {
-                if (mApInterfaceName != null && mApInterfaceName.equals(ifaceName)) {
+                if (mDataInterfaceName != null && mDataInterfaceName.equals(ifaceName)) {
                     sendMessage(CMD_INTERFACE_STATUS_CHANGED, 1);
                 }
             }
 
             @Override
             public void onDown(String ifaceName) {
-                if (mApInterfaceName != null && mApInterfaceName.equals(ifaceName)) {
+                if (mDataInterfaceName != null && mDataInterfaceName.equals(ifaceName)) {
                     sendMessage(CMD_INTERFACE_STATUS_CHANGED, 0);
                 }
             }
         };
+
+        private final InterfaceCallback mWifiNativeDualIfaceCallback = new InterfaceCallback() {
+            @Override
+            public void onDestroyed(String ifaceName) {
+                // one of the dual interface is destroyed by native layers. trigger full cleanup.
+                if (!expectedStop) {
+                    Log.e(TAG, "One of Dual interface ("+ifaceName+") destroyed. trigger cleanup");
+                    // Avoid cleaning the interface which is already destroyed.
+                    if (ifaceName.equals(mdualApInterfaces[0]))
+                        mdualApInterfaces[0] = "";
+                    else if (ifaceName.equals(mdualApInterfaces[1]))
+                        mdualApInterfaces[1] = "";
+
+                    stop();
+                }
+            }
+
+            @Override
+            public void onUp(String ifaceName) { }
+
+            @Override
+            public void onDown(String ifaceName) { }
+        };
+
+        /**
+         * Start Dual soft AP.
+         */
+        private boolean setupForDualSoftApMode(WifiConfiguration config) {
+            mdualApInterfaces[0] = mWifiNative.setupInterfaceForSoftApMode(
+                    mWifiNativeDualIfaceCallback);
+            mdualApInterfaces[1] = mWifiNative.setupInterfaceForSoftApMode(
+                    mWifiNativeDualIfaceCallback);
+
+            String bridgeIfacename = mWifiNative.setupInterfaceForBridgeMode(
+                    mWifiNativeInterfaceCallback);
+
+            mApInterfaceName = bridgeIfacename;
+            if (TextUtils.isEmpty(mdualApInterfaces[0]) ||
+                    TextUtils.isEmpty(mdualApInterfaces[1]) ||
+                    TextUtils.isEmpty(mApInterfaceName)) {
+                Log.e(TAG, "setup failure when creating dual ap interface(s).");
+                stopSoftAp();
+                updateApState(WifiManager.WIFI_AP_STATE_FAILED,
+                        WifiManager.WIFI_AP_STATE_DISABLED,
+                        WifiManager.SAP_START_FAILURE_GENERAL);
+                mWifiMetrics.incrementSoftApStartResult(false,
+                        WifiManager.SAP_START_FAILURE_GENERAL);
+                return false;
+            }
+            mDataInterfaceName = mWifiNative.getFstDataInterfaceName();
+            if (TextUtils.isEmpty(mDataInterfaceName)) {
+                mDataInterfaceName = mApInterfaceName;
+            }
+            updateApState(WifiManager.WIFI_AP_STATE_ENABLING,
+                    WifiManager.WIFI_AP_STATE_DISABLED, 0);
+
+            WifiConfiguration localConfig = new WifiConfiguration(config);
+            mApInterfaceName = mdualApInterfaces[0];
+            localConfig.apBand =  WifiConfiguration.AP_BAND_2GHZ;
+            int result = startSoftAp(localConfig);
+            if (result == SUCCESS) {
+                localConfig.apBand =  WifiConfiguration.AP_BAND_5GHZ;
+                mApInterfaceName = mdualApInterfaces[1];
+                result = startSoftAp(localConfig);
+            }
+
+            mApInterfaceName = bridgeIfacename;
+            if (result != SUCCESS) {
+                int failureReason = WifiManager.SAP_START_FAILURE_GENERAL;
+                if (result == ERROR_NO_CHANNEL) {
+                    failureReason = WifiManager.SAP_START_FAILURE_NO_CHANNEL;
+                }
+                updateApState(WifiManager.WIFI_AP_STATE_FAILED,
+                              WifiManager.WIFI_AP_STATE_ENABLING,
+                              failureReason);
+                stopSoftAp();
+                mWifiMetrics.incrementSoftApStartResult(false, failureReason);
+                return false;
+            }
+            if (!mWifiNative.setHostapdParams("softap bridge up " +mApInterfaceName)) {
+               Log.e(TAG, "Failed to set interface up " +mApInterfaceName);
+               return false;
+            }
+
+            return true;
+        }
 
         SoftApStateMachine(Looper looper) {
             super(TAG, looper);
@@ -336,6 +446,7 @@ public class SoftApManager implements ActiveModeManager {
             @Override
             public void enter() {
                 mApInterfaceName = null;
+                mDataInterfaceName = null;
                 mIfaceIsUp = false;
             }
 
@@ -343,6 +454,16 @@ public class SoftApManager implements ActiveModeManager {
             public boolean processMessage(Message message) {
                 switch (message.what) {
                     case CMD_START:
+                        WifiConfiguration config = (WifiConfiguration) message.obj;
+                        if (config != null && config.apBand == WifiConfiguration.AP_BAND_DUAL) {
+                            if (!setupForDualSoftApMode(config)) {
+                                Log.d(TAG, "Dual Sap start failed");
+                                break;
+                            }
+                            transitionTo(mStartedState);
+                            break;
+                        }
+
                         mApInterfaceName = mWifiNative.setupInterfaceForSoftApMode(
                                 mWifiNativeInterfaceCallback);
                         if (TextUtils.isEmpty(mApInterfaceName)) {
@@ -353,6 +474,10 @@ public class SoftApManager implements ActiveModeManager {
                             mWifiMetrics.incrementSoftApStartResult(
                                     false, WifiManager.SAP_START_FAILURE_GENERAL);
                             break;
+                        }
+                        mDataInterfaceName = mWifiNative.getFstDataInterfaceName();
+                        if (TextUtils.isEmpty(mDataInterfaceName)) {
+                            mDataInterfaceName = mApInterfaceName;
                         }
                         updateApState(WifiManager.WIFI_AP_STATE_ENABLING,
                                 WifiManager.WIFI_AP_STATE_DISABLED, 0);
@@ -460,15 +585,42 @@ public class SoftApManager implements ActiveModeManager {
                 }
                 mWifiMetrics.addSoftApNumAssociatedStationsChangedEvent(mNumAssociatedStations,
                         mMode);
-
-                if (mNumAssociatedStations == 0) {
-                    scheduleTimeoutMessage();
-                } else {
-                    cancelTimeoutMessage();
-                }
             }
 
-            private void onUpChanged(boolean isUp) {
+            /**
+             * Set New connected stations with this soft AP
+             * @param Macaddr Mac address of connected stations
+             */
+            private void setConnectedStations(String Macaddr) {
+
+                mQCNumAssociatedStations++;
+                if (mCallback != null) {
+                    mCallback.onStaConnected(Macaddr,mQCNumAssociatedStations);
+                } else {
+                    Log.e(TAG, "SoftApCallback is null. Dropping onStaConnected event.");
+                }
+                if (mQCNumAssociatedStations > 0)
+                    cancelTimeoutMessage();
+            }
+
+            /**
+             * Set Disconnected stations with this soft AP
+             * @param Macaddr Mac address of Disconnected stations
+             */
+            private void setDisConnectedStations(String Macaddr) {
+
+                if (mQCNumAssociatedStations > 0)
+                     mQCNumAssociatedStations--;
+                if (mCallback != null) {
+                    mCallback.onStaDisconnected(Macaddr, mQCNumAssociatedStations);
+                } else {
+                    Log.e(TAG, "SoftApCallback is null. Dropping onStaDisconnected event.");
+                }
+                if (mQCNumAssociatedStations == 0)
+                    scheduleTimeoutMessage();
+            }
+
+           private void onUpChanged(boolean isUp) {
                 if (isUp == mIfaceIsUp) {
                     return;  // no change
                 }
@@ -480,6 +632,7 @@ public class SoftApManager implements ActiveModeManager {
                     mWifiMetrics.incrementSoftApStartResult(true, 0);
                     if (mCallback != null) {
                         mCallback.onNumClientsChanged(mNumAssociatedStations);
+                        mCallback.onStaConnected("", mQCNumAssociatedStations);
                     }
                 } else {
                     // the interface was up, but goes down
@@ -491,7 +644,7 @@ public class SoftApManager implements ActiveModeManager {
             @Override
             public void enter() {
                 mIfaceIsUp = false;
-                onUpChanged(mWifiNative.isInterfaceUp(mApInterfaceName));
+                onUpChanged(mWifiNative.isInterfaceUp(mDataInterfaceName));
 
                 mTimeoutDelay = getConfigSoftApTimeoutDelay();
                 Handler handler = mStateMachine.getHandler();
@@ -508,6 +661,7 @@ public class SoftApManager implements ActiveModeManager {
 
                 Log.d(TAG, "Resetting num stations on start");
                 mNumAssociatedStations = 0;
+                mQCNumAssociatedStations = 0;
                 scheduleTimeoutMessage();
             }
 
@@ -521,6 +675,7 @@ public class SoftApManager implements ActiveModeManager {
                 }
                 Log.d(TAG, "Resetting num stations on stop");
                 mNumAssociatedStations = 0;
+                mQCNumAssociatedStations = 0;
                 cancelTimeoutMessage();
                 // Need this here since we are exiting |Started| state and won't handle any
                 // future CMD_INTERFACE_STATUS_CHANGED events after this point
@@ -530,6 +685,7 @@ public class SoftApManager implements ActiveModeManager {
 
                 mSarManager.setSapWifiState(WifiManager.WIFI_AP_STATE_DISABLED);
                 mApInterfaceName = null;
+                mDataInterfaceName = null;
                 mIfaceIsUp = false;
                 mStateMachine.quitNow();
             }
@@ -576,6 +732,22 @@ public class SoftApManager implements ActiveModeManager {
                             mWifiMetrics.incrementNumSoftApUserBandPreferenceUnsatisfied();
                         }
                         break;
+                    case CMD_CONNECTED_STATIONS:
+                        if (message.obj == null) {
+                            Log.e(TAG, "Invalid Macaddr of connected station: " + message.obj);
+                            break;
+                        }
+                        Log.d(TAG, "Setting Macaddr of stations on CMD_CONNECTED_STATIONS");
+                        setConnectedStations((String) message.obj);
+                        break;
+                    case CMD_DISCONNECTED_STATIONS:
+                        if (message.obj == null) {
+                            Log.e(TAG, "Invalid Macaddr of disconnected station: " + message.obj);
+                            break;
+                        }
+                        Log.d(TAG, "Setting Macaddr of stations on CMD_DISCONNECTED_STATIONS");
+                        setDisConnectedStations((String) message.obj);
+                        break;
                     case CMD_TIMEOUT_TOGGLE_CHANGED:
                         boolean isEnabled = (message.arg1 == 1);
                         if (mTimeoutEnabled == isEnabled) {
@@ -585,7 +757,7 @@ public class SoftApManager implements ActiveModeManager {
                         if (!mTimeoutEnabled) {
                             cancelTimeoutMessage();
                         }
-                        if (mTimeoutEnabled && mNumAssociatedStations == 0) {
+                        if (mTimeoutEnabled && mQCNumAssociatedStations == 0) {
                             scheduleTimeoutMessage();
                         }
                         break;

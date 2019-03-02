@@ -188,12 +188,15 @@ public class WifiStateMachinePrime {
      */
     public void stopSoftAPMode() {
         mHandler.post(() -> {
+            ArraySet<ActiveModeManager> removeList = new ArraySet();
             for (ActiveModeManager manager : mActiveModeManagers) {
                 if (manager instanceof SoftApManager) {
                     Log.d(TAG, "Stopping SoftApModeManager");
                     manager.stop();
+                    removeList.add(manager);
                 }
             }
+            mActiveModeManagers.removeAll(removeList);
             updateBatteryStatsWifiState(false);
         });
     }
@@ -332,6 +335,7 @@ public class WifiStateMachinePrime {
                 mDefaultModeManager.sendScanAvailableBroadcast(mContext, false);
                 mScanRequestProxy.enableScanningForHiddenNetworks(false);
                 mScanRequestProxy.clearScanResults();
+                WifiGbk.clearBssCache(); // wifigbk++
             }
 
             @Override
@@ -542,6 +546,24 @@ public class WifiStateMachinePrime {
                 mSoftApCallback.onNumClientsChanged(numClients);
             } else {
                 Log.d(TAG, "SoftApCallback is null. Dropping NumClientsChanged event.");
+            }
+        }
+
+        @Override
+        public void onStaConnected(String Macaddr, int numClients) {
+            if (mSoftApCallback != null) {
+                mSoftApCallback.onStaConnected(Macaddr, numClients);
+            } else {
+                Log.d(TAG, "SoftApCallback is null. Dropping onStaConnected event.");
+            }
+        }
+
+        @Override
+        public void onStaDisconnected(String Macaddr, int numClients) {
+            if (mSoftApCallback != null) {
+                mSoftApCallback.onStaDisconnected(Macaddr, numClients);
+            } else {
+                Log.d(TAG, "SoftApCallback is null. Dropping onStaDisconnected event.");
             }
         }
     }
